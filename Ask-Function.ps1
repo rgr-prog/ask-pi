@@ -114,6 +114,64 @@ function Reset-AskSession {
     return $sessionDir
 }
 
+function Get-AskSessionSummary {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SessionName
+    )
+
+    $sessionDir = Join-Path $script:AskSessionRoot (Normalize-AskSessionName -SessionName $SessionName)
+    if (-not (Test-Path -LiteralPath $sessionDir)) {
+        return $null
+    }
+
+    $sessionFile = Get-ChildItem -LiteralPath $sessionDir -File -Filter *.jsonl -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+
+    if (-not $sessionFile) {
+        return $null
+    }
+
+    foreach ($line in Get-Content -LiteralPath $sessionFile.FullName -ErrorAction SilentlyContinue) {
+        if (-not $line -or -not $line.Trim()) { continue }
+
+        try {
+            $entry = $line | ConvertFrom-Json -ErrorAction Stop
+        }
+        catch {
+            continue
+        }
+
+        if ($entry.type -ne 'message' -or $entry.message.role -ne 'user') {
+            continue
+        }
+
+        $contentParts = @()
+        foreach ($block in @($entry.message.content)) {
+            if ($block.type -eq 'text' -and $block.text) {
+                $contentParts += $block.text
+            }
+        }
+
+        $summary = ($contentParts -join ' ').Trim()
+        if (-not $summary) {
+            return $null
+        }
+
+        $summary = $summary -replace '^PERGUNTA:\s*', ''
+        $summary = ($summary -replace '\s+', ' ').Trim()
+
+        if ($summary.Length -gt 80) {
+            $summary = $summary.Substring(0, 77).TrimEnd() + '...'
+        }
+
+        return $summary
+    }
+
+    return $null
+}
+
 function Ask {
     <#
     .SYNOPSIS
@@ -161,6 +219,9 @@ function Ask {
 
         [switch]$NoSession,
 
+        [Alias("l")]
+        [switch]$ListSessions,
+
         [Alias("h")]
         [switch]$Help
     )
@@ -185,6 +246,7 @@ OPTIONS:
   --ResetSession         Clears the current named session before asking again.
   --ResetModel           Resets the last saved model to the automatic default.
   --NoSession            Ignores any saved session and does not reuse context.
+  --ListSessions         Lists saved session folders and exits.
   -h, --Help             Shows this help menu.
 
 EXAMPLES:
@@ -212,6 +274,38 @@ EXAMPLES:
 
     end {
         if ($script:AskShowHelp) { return }
+
+        if ($ListSessions) {
+            $defaultSession = $script:AskState.DefaultSession
+            $sessionNames = @()
+
+            if (Test-Path -LiteralPath $script:AskSessionRoot) {
+                $sessionNames = Get-ChildItem -LiteralPath $script:AskSessionRoot -Directory -ErrorAction SilentlyContinue |
+                    Sort-Object Name |
+                    Select-Object -ExpandProperty Name
+            }
+
+            if (-not $sessionNames -or $sessionNames.Count -eq 0) {
+                Write-Host "No saved sessions found."
+                return
+            }
+
+            foreach ($name in $sessionNames) {
+                $summary = Get-AskSessionSummary -SessionName $name
+                if (-not $summary) {
+                    $summary = "(sem resumo)"
+                }
+
+                if ($defaultSession -and $name -eq $defaultSession) {
+                    Write-Host "* $name - $summary"
+                }
+                else {
+                    Write-Host "  $name - $summary"
+                }
+            }
+
+            return
+        }
 
         $Question = ($QuestionParts -join ' ').Trim()
 
@@ -307,6 +401,7 @@ EXAMPLES:
 
         $piArgs += $fullPrompt
 
+        $global:AskPromptInitialized = $true
         & pi @piArgs
     }
 }
