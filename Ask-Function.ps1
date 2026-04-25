@@ -246,7 +246,7 @@ OPTIONS:
   --ResetSession         Clears the current named session before asking again.
   --ResetModel           Resets the last saved model to the automatic default.
   --NoSession            Ignores any saved session and does not reuse context.
-  --ListSessions         Lists saved session folders and exits.
+  -l, --ListSessions     Lists saved session folders with one-line summaries and exits.
   -h, --Help             Shows this help menu.
 
 EXAMPLES:
@@ -259,6 +259,7 @@ EXAMPLES:
   ask -s abc123 -ResetSession "start over in this session"
   ask -ResetModel "go back to the automatic default model"
   ask -NoSession "one-off question"
+  ask -l
 "@
             return
         }
