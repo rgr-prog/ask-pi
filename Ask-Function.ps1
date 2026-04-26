@@ -126,8 +126,8 @@ function Get-AskSessionSummary {
     }
 
     $sessionFile = Get-ChildItem -LiteralPath $sessionDir -File -Filter *.jsonl -ErrorAction SilentlyContinue |
-        Sort-Object LastWriteTime -Descending |
-        Select-Object -First 1
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
 
     if (-not $sessionFile) {
         return $null
@@ -172,6 +172,78 @@ function Get-AskSessionSummary {
     return $null
 }
 
+function Get-AskSessionHistory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SessionName,
+
+        [Parameter(Mandatory = $false)]
+        [int]$Count = 20
+    )
+
+    $sessionDir = Join-Path $script:AskSessionRoot (Normalize-AskSessionName -SessionName $SessionName)
+    if (-not (Test-Path -LiteralPath $sessionDir)) {
+        return $null
+    }
+
+    $sessionFile = Get-ChildItem -LiteralPath $sessionDir -File -Filter *.jsonl -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+
+    if (-not $sessionFile) {
+        return $null
+    }
+
+    $history = New-Object System.Collections.Generic.List[object]
+
+    foreach ($line in Get-Content -LiteralPath $sessionFile.FullName -ErrorAction SilentlyContinue) {
+        if (-not $line -or -not $line.Trim()) { continue }
+
+        try {
+            $entry = $line | ConvertFrom-Json -ErrorAction Stop
+        }
+        catch {
+            continue
+        }
+
+        if ($entry.type -ne 'message' -or -not $entry.message.role) {
+            continue
+        }
+
+        $contentParts = @()
+        foreach ($block in @($entry.message.content)) {
+            if ($block.type -eq 'text' -and $block.text) {
+                $contentParts += $block.text
+            }
+        }
+
+        $text = ($contentParts -join ' ').Trim()
+        if (-not $text) {
+            continue
+        }
+
+        $text = ($text -replace '\s+', ' ').Trim()
+        if ($text.Length -gt 400) {
+            $text = $text.Substring(0, 397).TrimEnd() + '...'
+        }
+
+        $history.Add([pscustomobject]@{
+            Role = $entry.message.role
+            Text = $text
+        })
+    }
+
+    if ($history.Count -eq 0) {
+        return $null
+    }
+
+    if ($Count -lt 1) {
+        $Count = 1
+    }
+
+    return @($history | Select-Object -Last $Count)
+}
+
 function Ask {
     <#
     .SYNOPSIS
@@ -208,6 +280,17 @@ function Ask {
         [Alias("s")]
         [string]$Session,
 
+        [Alias("D")]
+        [string]$DefaultSession,
+
+        [string]$HistorySession,
+
+        [Alias("n")]
+        [int]$HistoryCount = 20,
+
+        [Alias("q")]
+        [switch]$QueryMode,
+
         [Alias("r")]
         [switch]$RememberSession,
 
@@ -241,7 +324,12 @@ OPTIONS:
   -m, --Model            Sets the model and saves it as the last one used by ask.
                          If omitted, uses the last saved model; if none exists, lets pi decide.
   -s, --Session          Uses a named session (e.g. abc123) stored in the user profile.
-  -r, --RememberSession  Uses the current session; if none exists, creates a random one and makes it the default for the user.
+    -D, --DefaultSession    Sets an existing session as the default for future asks and the prompt.
+    --History              Shows the recent message history from a session.
+    -n, --Count            Limits how many history messages are shown with -H.
+    -q, --Query            Treat everything after -q as literal query text and stop parsing options there.
+    -r, --RememberSession  Reuses the current/default session; if you pass a session name right after -r,
+                                                 that session is reused or created and becomes the default for later prompts.
   --ClearSession         Removes the saved default session from the user profile.
   --ResetSession         Clears the current named session before asking again.
   --ResetModel           Resets the last saved model to the automatic default.
@@ -255,10 +343,14 @@ EXAMPLES:
   ask -f .\.env "check for exposed secrets"
   ask -m openai/gpt-4o "use this model and save it for next time"
   ask -s abc123 "let's continue this conversation"
-  ask -s abc123 -r "make this session the default"
+    ask -D abc123
+    ask --History abc123 -n 20
+    ask -r abc123 "make this session the default"
+    ask -s abc123 -r "make this session the default"
   ask -s abc123 -ResetSession "start over in this session"
   ask -ResetModel "go back to the automatic default model"
   ask -NoSession "one-off question"
+    ask -q hello guy -r
   ask -l
 "@
             return
@@ -282,8 +374,8 @@ EXAMPLES:
 
             if (Test-Path -LiteralPath $script:AskSessionRoot) {
                 $sessionNames = Get-ChildItem -LiteralPath $script:AskSessionRoot -Directory -ErrorAction SilentlyContinue |
-                    Sort-Object Name |
-                    Select-Object -ExpandProperty Name
+                Sort-Object Name |
+                Select-Object -ExpandProperty Name
             }
 
             if (-not $sessionNames -or $sessionNames.Count -eq 0) {
@@ -308,7 +400,89 @@ EXAMPLES:
             return
         }
 
-        $Question = ($QuestionParts -join ' ').Trim()
+        if ($DefaultSession) {
+            $normalizedDefaultSession = Normalize-AskSessionName -SessionName $DefaultSession
+            $defaultSessionDir = Join-Path $script:AskSessionRoot $normalizedDefaultSession
+
+            if (-not (Test-Path -LiteralPath $defaultSessionDir)) {
+                Write-Warning "Default session not found: $normalizedDefaultSession"
+                return
+            }
+
+            Save-AskState -DefaultSession $normalizedDefaultSession
+            $global:AskPromptInitialized = $true
+            return
+        }
+
+        if ($HistorySession -or $PSBoundParameters.ContainsKey('HistoryCount')) {
+            $historySessionName = $HistorySession
+            if (-not $historySessionName) {
+                $historySessionName = $script:AskState.DefaultSession
+            }
+
+            if (-not $historySessionName) {
+                Write-Warning "Use -H <session> or set a default session first."
+                return
+            }
+
+            $normalizedHistorySession = Normalize-AskSessionName -SessionName $historySessionName
+            $history = Get-AskSessionHistory -SessionName $normalizedHistorySession -Count $HistoryCount
+
+            if (-not $history) {
+                Write-Warning "No history found for session: $normalizedHistorySession"
+                return
+            }
+
+            Write-Host "Session: $normalizedHistorySession"
+            Write-Host "Showing last $([Math]::Min([Math]::Max($HistoryCount, 1), $history.Count)) message(s):"
+            Write-Host ""
+
+            $index = 0
+            foreach ($item in $history) {
+                $index++
+                Write-Host ("[{0}] {1}: {2}" -f $index, $item.Role, $item.Text)
+            }
+
+            return
+        }
+
+        $rememberedSessionName = $null
+        $queryTail = $null
+        $queryModePrefix = $null
+
+        if ($QueryMode -and $MyInvocation.Line) {
+            $queryMatch = [regex]::Match($MyInvocation.Line, '(?<!\S)-(?:q|Query)(?:\s+|$)(?<query>.*)$', [System.Text.RegularExpressions.RegexOptions]::Singleline)
+            if ($queryMatch.Success) {
+                $queryTail = $queryMatch.Groups['query'].Value.Trim()
+                $queryModePrefix = $MyInvocation.Line.Substring(0, $queryMatch.Index)
+            }
+        }
+
+        if ($QueryMode -and $queryModePrefix -and ($queryModePrefix -match '(?<!\S)-(?:r|RememberSession)(?=\s|$)')) {
+            $rememberedSessionName = $null
+        }
+
+        if ($QueryMode -and $queryTail) {
+            $Question = $queryTail
+        }
+        else {
+            $questionPartsToUse = $QuestionParts
+
+            if ($RememberSession -and $QuestionParts.Count -gt 0) {
+                $firstQuestionPart = $QuestionParts[0]
+                if ($firstQuestionPart -match '^[a-zA-Z0-9][a-zA-Z0-9._-]*$' -and $firstQuestionPart -match '[0-9._-]') {
+                    $rememberedSessionName = Normalize-AskSessionName -SessionName $firstQuestionPart
+                    if ($QuestionParts.Count -gt 1) {
+                        $questionPartsToUse = $QuestionParts[1..($QuestionParts.Count - 1)]
+                    }
+                    else {
+                        $questionPartsToUse = @()
+                    }
+                }
+            }
+
+            $Question = ($questionPartsToUse -join ' ').Trim()
+        }
 
         if ($ClearSession) {
             Save-AskState -DefaultSession $null
@@ -334,11 +508,17 @@ EXAMPLES:
         if ($Session) {
             $effectiveSession = (Normalize-AskSessionName -SessionName $Session)
         }
+        elseif ($rememberedSessionName) {
+            $effectiveSession = $rememberedSessionName
+        }
         elseif (-not $NoSession -and $script:AskState.DefaultSession) {
             $effectiveSession = $script:AskState.DefaultSession
         }
 
         $shouldRememberSession = $RememberSession
+        if ($QueryMode -and $queryModePrefix -and -not ($queryModePrefix -match '(?<!\S)-(?:r|RememberSession)(?=\s|$)')) {
+            $shouldRememberSession = $false
+        }
         if ($shouldRememberSession -and -not $effectiveSession) {
             $effectiveSession = ('ask-' + ([guid]::NewGuid().ToString('N').Substring(0, 12)))
         }
